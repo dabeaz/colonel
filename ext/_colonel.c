@@ -7,6 +7,7 @@
 #include "structmember.h"
 #include <unistd.h>
 #include <sys/socket.h>
+#include <assert.h>
 
 /* Exceptions */
 
@@ -45,6 +46,9 @@ void delete_Timeout(Timeout *t) {
 }
 
 /* Cancellation Support */
+
+typedef struct Kernel Kernel;
+typedef struct CTask CTask;
 
 typedef void (*cancelfunc_t)(struct Kernel *, struct CTask *);
 
@@ -95,9 +99,16 @@ void Selector_register(Selector *sel, int op, int fileno, void *data) {
   kevent(sel->kq, &event, 1, &event, 0, NULL);
 }
 
-void Selector_unregister(Selector *sel, int fileno) {
+void Selector_unregister(Selector *sel, int fileno, int op) {
   struct kevent event;
-  EV_SET(&event, fileno, 0, EV_DELETE, 0, 0, 0);
+  int filter;
+  if (op == EVENT_READ) {
+    filter = EVFILT_READ;
+  } 
+  if (op == EVENT_WRITE) {
+    filter = EVFILT_WRITE;
+  }
+  EV_SET(&event, fileno, filter, EV_DELETE, 0, 0, 0);
   kevent(sel->kq, &event, 1, &event, 0, NULL);
 }
 
@@ -157,7 +168,7 @@ static void delete_TaskQueue(TaskQueue *);
  * other details.
  * ----------------------------------------------------------------------------- */
 
-typedef struct CTask {
+struct CTask {
   PyObject_HEAD
   struct CTask *next;
   struct CTask *prev;
@@ -183,12 +194,13 @@ typedef struct CTask {
   /* Cancellation */
   cancelfunc_t    cancelfunc;
   int             current_fd;       /* Current fd used for I/O */
+  int             current_op;       /* Current IO operation */
   PyObject       *wait_queue;
   PyObject       *future;
   PyObject       *sigset;
   struct CTask          *join_task;
 
-} CTask;
+};
 
 /* Create a new CTask object wrapped around a coroutine */
 CTask *
@@ -375,7 +387,7 @@ TaskQueue_pop(TaskQueue *q) {
   return task;
 }
 
-static CTask *
+void
 TaskQueue_remove(TaskQueue *q, CTask *task) {
   if (task->prev) {
     task->prev->next = task->next;
@@ -393,7 +405,7 @@ TaskQueue_remove(TaskQueue *q, CTask *task) {
  * Kernel
  * ----------------------------------------------------------------------------- */
 
-typedef struct Kernel {
+struct Kernel {
   PyObject  *pykernel;
   TaskQueue *ready;
   Selector  *selector;
@@ -405,7 +417,7 @@ typedef struct Kernel {
   int        signal_init;
   int        wake_fd;
   PyObject  *wake_queue;
-} Kernel;
+};
 
 Kernel *
 new_Kernel(PyObject *pykernel, PyObject *task_factory) {
@@ -449,8 +461,9 @@ new_Kernel(PyObject *pykernel, PyObject *task_factory) {
 
 void
 delete_Kernel(Kernel *kernel) {
+  printf("Deleting KernelState\n");
   if (kernel->wake_fd > 0) {
-    Selector_unregister(kernel->selector, kernel->wake_fd);
+    Selector_unregister(kernel->selector, kernel->wake_fd, EVENT_READ);
   }
   delete_TaskQueue(kernel->ready);
   delete_Selector(kernel->selector);
@@ -460,9 +473,24 @@ delete_Kernel(Kernel *kernel) {
   free(kernel);
 }
 
+static Kernel *
+PyKernel_AsKernel(PyObject *obj) {
+  return (Kernel *) PyCapsule_GetPointer(obj, "KernelState");
+}
+
+static void del_PyKernel(PyObject *obj) {
+  delete_Kernel((Kernel *) PyCapsule_GetPointer(obj, "KernelState"));
+}
+
+static PyObject *
+PyKernel_FromKernel(Kernel *kernel, int must_free) {
+  return PyCapsule_New(kernel, "KernelState", must_free ? del_PyKernel : NULL);
+}
+
 /* Put a task on the ready queue */
 void
 Kernel_schedule_ready(Kernel *kernel, CTask *task) {
+  assert(!task->terminated);
   TaskQueue_push(kernel->ready, task);
   task->cancelfunc = NULL;
 }
@@ -556,7 +584,9 @@ void Kernel_init_signals(Kernel *kernel) {
 typedef int (*trapfunc)(Kernel *, CTask *, PyObject *);
 
 static void _io_cancel(Kernel *kernel, CTask *task) {
-  Selector_unregister(kernel->selector, task->current_fd);
+  Selector_unregister(kernel->selector, task->current_fd, task->current_op);
+  task->current_fd = -1;
+  task->current_op = -1;
 }
 
 static int _trap_io(Kernel *kernel, CTask *task, PyObject *args) {
@@ -574,14 +604,14 @@ static int _trap_io(Kernel *kernel, CTask *task, PyObject *args) {
   if (fd == -1) {
     return 0;
   }
-
   if ((task->last_io_op != op) || (task->last_io_fd != fd)) {
     if (task->last_io_fd > 0) {
-      Selector_unregister(kernel->selector, task->last_io_fd);
+      Selector_unregister(kernel->selector, task->last_io_fd, task->last_io_op);
     }
     Selector_register(kernel->selector, op, fd, (void *) task);
   }
   task->current_fd = fd;
+  task->current_op = op;
   task->cancelfunc = _io_cancel;
   task->last_io_op = -1;
   task->last_io_fd = -1;
@@ -825,12 +855,11 @@ static void _sigwait_cancel(Kernel *kernel, CTask *task) {
 static int _trap_sigwait(Kernel *kernel, CTask *task, PyObject *args) {
   PyObject *trapnum;
   PyObject *sigset;
-  PyObject *result;
 
   if (!PyArg_ParseTuple(args, "OO", &trapnum, &sigset)) {
     return 0;
   }
-  PyObject_SetAttrString(sigset, "waiting", task);
+  PyObject_SetAttrString(sigset, "waiting", (PyObject *) task);
   task->sigset = sigset;
   task->cancelfunc = _sigwait_cancel;
   return 1;
@@ -938,6 +967,12 @@ cleanup_task(Kernel *kernel, CTask *task) {
   CTask *child;
 
   task->terminated = 1;
+
+  if (task->last_io_fd >= 0) {
+    Selector_unregister(kernel->selector, task->last_io_fd, task->last_io_op);
+    task->last_io_fd = -1;
+    task->last_io_op = 0;
+  }
 
   /* Put all joining tasks back on ready queue */
   while (1) {
@@ -1058,12 +1093,10 @@ handle_sleeping(Kernel *kernel) {
  * ----------------------------------------------------------------------------- */
 
 PyObject *
-Kernel_run(PyObject *pykernel, PyObject *coro, PyObject *task_factory) {
-  Kernel *kernel;
+Kernel_run(Kernel *kernel, PyObject *coro) {
   CTask *task;
   PyObject *request;
 
-  kernel = new_Kernel(pykernel, task_factory);
   task = Kernel_new_task(kernel, coro, NULL);
   Kernel_schedule_ready(kernel, task);
   kernel->ntasks++;
@@ -1094,7 +1127,7 @@ Kernel_run(PyObject *pykernel, PyObject *coro, PyObject *task_factory) {
       PyObject *pytrapnum;
 
       /*
-       printf("REQUEST:");
+      printf("REQUEST: %x ", task);
        PyObject_Print(request, stdout, 0);
        printf("\n");
       */
@@ -1123,9 +1156,9 @@ Kernel_run(PyObject *pykernel, PyObject *coro, PyObject *task_factory) {
       } else {
 	int status = trap_table[trapnum](kernel, task, request);
 	if (task->last_io_fd >= 0) {
-	  Selector_unregister(kernel->selector, task->last_io_fd);
-	  task->last_io_op = -1;
+	  Selector_unregister(kernel->selector, task->last_io_fd, task->last_io_op);
 	  task->last_io_fd = -1;
+	  task->last_io_op = 0;
 	}
 	if (!status) {
 	  /* Trap function failed */
@@ -1148,9 +1181,13 @@ Kernel_run(PyObject *pykernel, PyObject *coro, PyObject *task_factory) {
       PyErr_Restore(type, value, traceback);
       if (PyErr_ExceptionMatches(PyExc_StopIteration)) {
 	task->next_value = value ? PyObject_GetAttrString(value, "value") : NULL;
-	printf("Task Done\n");
+	printf("Task Done %x\n", task);
+      } else if (PyErr_ExceptionMatches(Curio_CancelledError)) {
+	task->next_value = Py_None;
+	Py_INCREF(task->next_value);
+	task->next_exc = NULL;
       } else {
-	printf("Task Crash\n");
+	printf("Task Crash %x\n", task);
 	task->next_exc = value;
 	Py_INCREF(value);
 	PyErr_PrintEx(0);
@@ -1160,28 +1197,47 @@ Kernel_run(PyObject *pykernel, PyObject *coro, PyObject *task_factory) {
       PyErr_Clear();
     }
   }
-  delete_Kernel(kernel);
   return Py_BuildValue("");
  error:
-  delete_Kernel(kernel);
   return NULL;
 }
 
 PyObject *
 py_run(PyObject *self, PyObject *args) {
-  PyObject *pykernel;
+  PyObject *kernelstate;
   PyObject *coro;
-  PyObject *task_factory;
   PyObject *result;
-  if (!PyArg_ParseTuple(args, "OOO", &pykernel, &coro, &task_factory)) {
+  Kernel   *kernel;
+
+  if (!PyArg_ParseTuple(args, "OO", &kernelstate, &coro)) {
     return NULL;
   }
-  result = Kernel_run(pykernel, coro, task_factory);
+
+  kernel = PyKernel_AsKernel(kernelstate);
+  if (!kernel) {
+    return NULL;
+  }
+  result = Kernel_run(kernel, coro);
   return result;
+}
+
+PyObject *
+py_kernelstate(PyObject *self, PyObject *args) {
+  PyObject *pykernel;
+  PyObject *task_factory;
+  PyObject *result;
+  Kernel *kernel;
+
+  if (!PyArg_ParseTuple(args, "OO", &pykernel, &task_factory)) {
+    return NULL;
+  }
+  kernel = new_Kernel(pykernel, task_factory);
+  return PyKernel_FromKernel(kernel, 1);
 }
 
 static PyMethodDef ColonelMethods[] = {
   { "run", py_run, METH_VARARGS, NULL },
+  { "kernelstate", py_kernelstate, METH_VARARGS, NULL },
   { NULL, NULL, 0, NULL },
 };
 

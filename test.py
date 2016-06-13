@@ -139,6 +139,6 @@ async def test9():
             signo = await sig.wait()
             print("Got signal", signo)
 
-colonel.run(test9())
+colonel.run(test8())
 
 

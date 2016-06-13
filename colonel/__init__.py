@@ -21,7 +21,6 @@ class Task(_colonel.CTask):
             return self.next_value
 
     async def cancel(self):
-        print("CANCEL HERE1")
         if self.terminated:
             return False
         else:
@@ -47,12 +46,15 @@ class Colonel(Kernel):
         return tasks
 
     def run(self, coro=None, *, shutdown=False):
+        if not hasattr(self, "_kernelstate"):
+            self._kernelstate = _colonel.kernelstate(self, Task)
         if coro:
-            result = _colonel.run(self, coro, Task)
+            result = _colonel.run(self._kernelstate, coro)
         else:
             result = None
         if shutdown:
             self._shutdown_resources()
+            self._kernelstate = None
         return result
 
 def run(coro):
