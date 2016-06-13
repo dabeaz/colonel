@@ -150,7 +150,95 @@ int Selector_select(Selector *sel, IOEvent *ioevents, int maxevents, _PyTime_t t
 #endif
 
 #ifdef HAVE_EPOLL
-#echo "HAS EPOLL"
+
+#include <sys/epoll.h>
+
+#define MAX_EVENT 64
+typedef struct Selector {
+  int efd;
+  void **data;
+  int datamax;
+} Selector;
+
+static Selector *
+new_Selector(void) {
+  Selector *sel;
+  sel = (Selector *) malloc(sizeof(Selector));
+  sel->efd = epoll_create1(0);
+  sel->data = (void **) malloc(MAX_EVENT*sizeof(void *));
+  sel->datamax = MAX_EVENT;
+  return sel;
+}
+
+static void
+delete_Selector(Selector *sel) {
+  close(sel->efd);
+  free(sel->data);
+  free(sel);
+}
+
+static void 
+Selector_register(Selector *sel, int op, int fileno, void *data) {
+  struct epoll_event ev;
+  unsigned int events = EPOLLET;
+
+  printf("register %d\n", fileno);
+  if (op & EVENT_READ) {
+    events |= EPOLLIN;
+  }
+  if (op & EVENT_WRITE) {
+    events |= EPOLLOUT;
+  }
+  while (fileno >= sel->datamax) {
+    sel->data = (void **) realloc(sel->data, 2*sel->datamax*sizeof(void *));
+    sel->datamax *= 2;
+  }
+  sel->data[fileno] = data;
+  ev.events = events;
+  ev.data.fd = fileno;
+  epoll_ctl(sel->efd, EPOLL_CTL_ADD, fileno, &ev);
+}
+
+void Selector_unregister(Selector *sel, int fileno, int op) {
+  struct epoll_event ev;
+  printf("unregister %d\n", fileno);
+  ev.events = 0;
+  ev.data.fd = fileno;
+  epoll_ctl(sel->efd, EPOLL_CTL_DEL, fileno, &ev);
+}
+
+int Selector_select(Selector *sel, IOEvent *ioevents, int maxevents, _PyTime_t timeout) {
+  /* Wait for events */
+  int nev, n, op;
+  struct epoll_event events[MAX_EVENT];
+  struct epoll_event *evt;
+  _PyTime_t ms = -1;
+
+  if (timeout) {
+    ms = _PyTime_AsMilliseconds(timeout, _PyTime_ROUND_CEILING);
+  }
+
+  maxevents = maxevents < MAX_EVENT ? maxevents : MAX_EVENT;
+
+  Py_BEGIN_ALLOW_THREADS
+    nev = epoll_wait(sel->efd, &events[0], maxevents, (int) ms);
+  Py_END_ALLOW_THREADS
+
+  for (n = 0, evt=events; n < nev; n++, evt++, ioevents++) {
+    op = 0;
+    if (evt->events & EPOLLIN) {
+      op |= EVENT_READ;
+    }
+    if (evt->events & EPOLLOUT) {
+      op |= EVENT_WRITE;
+    }
+    ioevents->op = op;
+    ioevents->fileno = evt->data.fd;
+    ioevents->data = sel->data[evt->data.fd];
+  }
+  return nev;
+}
+
 #endif
 
 /* Forward declaration */
